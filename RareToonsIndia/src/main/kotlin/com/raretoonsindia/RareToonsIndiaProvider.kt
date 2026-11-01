@@ -137,7 +137,7 @@ class RareToonsIndiaProvider : MainAPI() {
     private val mediaRegex = Regex("""\.(m3u8|mp4|mkv)""")
 
     private fun priority(label: String): Int = when {
-        label.contains("watchnow", true) -> 0
+        label.contains("multi", true) -> 0
         label.contains("watch", true) -> 1
         else -> 2
     }
@@ -157,15 +157,20 @@ class RareToonsIndiaProvider : MainAPI() {
         for (link in usable) {
             if (found) break
             try {
-                if (link.label.contains("watch", true)) {
+                val resolved = app.get(link.url, referer = "$mainUrl/").url
+
+                if (resolved.contains("/multiquality/")) {
+                    val id = Regex("""[?&]url=([^&#]+)""").find(resolved)?.groupValues?.get(1)
+                    if (id != null) {
+                        val embed = "https://argon.razorshell.space/embed/$id"
+                        if (extractFromEmbed(embed, "https://codedew.com/", link, callback)) found = true
+                    }
+                } else if (resolved.contains("codedew.com")) {
                     if (sniffPlayer(link, callback)) found = true
                 } else {
-                    val resolved = app.get(link.url, referer = "$mainUrl/").url
-                    if (!resolved.contains("codedew.com")) {
-                        loadExtractor(resolved, "$mainUrl/", subtitleCallback) {
-                            found = true
-                            callback(it)
-                        }
+                    loadExtractor(resolved, "$mainUrl/", subtitleCallback) {
+                        found = true
+                        callback(it)
                     }
                 }
             } catch (_: Exception) {
@@ -211,7 +216,7 @@ class RareToonsIndiaProvider : MainAPI() {
         val res = app.get(
             embedUrl,
             referer = referer,
-            interceptor = WebViewResolver(mediaRegex, timeout = 25_000L)
+            interceptor = WebViewResolver(mediaRegex, timeout = 30_000L)
         )
         val src = res.url
         if (!mediaRegex.containsMatchIn(src)) return false
