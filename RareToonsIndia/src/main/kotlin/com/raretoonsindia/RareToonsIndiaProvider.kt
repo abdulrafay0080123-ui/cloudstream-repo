@@ -14,8 +14,6 @@ class RareToonsIndiaProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.Cartoon)
 
-    // The site's home page is only a landing page, so the main page uses category archives.
-    // Pagination format: /category/<slug>/page/<n>/
     override val mainPage = mainPageOf(
         "$mainUrl/category/animes/page/" to "Animes",
         "$mainUrl/category/popular-shows/page/" to "Popular Shows",
@@ -26,13 +24,10 @@ class RareToonsIndiaProvider : MainAPI() {
         "$mainUrl/category/telugu/page/" to "Telugu",
     )
 
-    // One row of buttons on the site, e.g. "Hindi – [WatchMultiQuality] [HubCloud] [WatchNow]"
     data class LinkInfo(val lang: String, val label: String, val url: String)
 
     private val episodeRegex = Regex("""^Episode\s*(\d+)\s*[–\-:]?\s*(.*)$""", RegexOption.IGNORE_CASE)
     private val langRegex = Regex("""^(Hindi Sub|Hindi|Tamil|Telugu|Bengali|Malayalam|English|Kannada|Marathi)\b""", RegexOption.IGNORE_CASE)
-
-    // ---------- Listing ----------
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val document = app.get("${request.data}$page/").document
@@ -51,7 +46,6 @@ class RareToonsIndiaProvider : MainAPI() {
             .ifBlank { raw.trim() }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        // The title link points at a post URL, not at /category/ or /tag/
         val a = select("a[href]").firstOrNull {
             val h = it.attr("href")
             h.startsWith(mainUrl) && !h.contains("/category/") && !h.contains("/tag/") &&
@@ -73,8 +67,6 @@ class RareToonsIndiaProvider : MainAPI() {
         }
     }
 
-    // ---------- Details ----------
-
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url).document
 
@@ -90,10 +82,9 @@ class RareToonsIndiaProvider : MainAPI() {
             ?.text()?.let { Regex("""(19|20)\d{2}""").find(it)?.value?.toIntOrNull() }
         val tags = document.select("a[rel=tag], a[rel='category tag']").map { it.text() }.distinct()
 
-        // Walk through the post's <p> tags in order and group button rows under their "Episode NN – Title" line.
         class Ep(val number: Int, val title: String, val links: MutableList<LinkInfo> = mutableListOf())
         val eps = mutableListOf<Ep>()
-        val looseLinks = mutableListOf<LinkInfo>() // links that appear before any "Episode" line (movies)
+        val looseLinks = mutableListOf<LinkInfo>()
 
         document.select("article p").forEach { p ->
             val text = p.text().trim()
@@ -103,7 +94,6 @@ class RareToonsIndiaProvider : MainAPI() {
             if (anchors.isEmpty() && epMatch != null) {
                 eps.add(Ep(epMatch.groupValues[1].toInt(), epMatch.groupValues[2].trim()))
             } else if (anchors.isNotEmpty()) {
-                // Row such as "Hindi – [..] [..]" or "Episode 01 – Untouched (Multi Audio) – [..] [..]"
                 val lang = when {
                     epMatch != null && text.contains("Multi Audio", true) -> "Multi Audio"
                     else -> langRegex.find(text)?.value ?: "Hindi"
@@ -144,7 +134,13 @@ class RareToonsIndiaProvider : MainAPI() {
         }
     }
 
-    // ---------- Links ----------
+    private val mediaRegex = Regex("""\.(m3u8|mp4|mkv)""")
+
+    private fun priority(label: String): Int = when {
+        label.contains("multi", true) -> 0
+        label.contains("watch", true) -> 1
+        else -> 2
+    }
 
     override suspend fun loadLinks(
         data: String,
@@ -153,21 +149,25 @@ class RareToonsIndiaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val links = parseJson<List<LinkInfo>>(data)
-        // Mega and "DL" buttons are download-only, so only streamable buttons are tried
-        val usable = links.filterNot { it.label.contains("mega", true) || it.label.startsWith("DL", true) }
+        val usable = links
+            .filterNot { it.label.contains("mega", true) || it.label.startsWith("DL", true) }
+            .sortedBy { priority(it.label) }
         var found = false
 
-        usable.amap { link ->
+        for (link in usable) {
+            if (found) break
             try {
-                // codedew.com/zipper/?url=... redirects to codedew.com/multiquality/?url=<id>
                 val resolved = app.get(link.url, referer = "$mainUrl/").url
 
-                if (resolved.contains("codedew.com")) {
-                    val page = app.get(resolved, referer = "$mainUrl/").document
-                    val embed = page.selectFirst("iframe[src]")?.attr("src") ?: return@amap
-                    if (extractFromEmbed(embed, resolved, link, callback)) found = true
+                if (resolved.contains("/multiquality/")) {
+                    val id = Regex("""[?&]url=([^&#]+)""").find(resolved)?.groupValues?.get(1)
+                    if (id != null) {
+                        val embed = "https://argon.razorshell.space/embed/$id"
+                        if (extractFromEmbed(embed, "https://codedew.com/", link, callback)) found = true
+                    }
+                } else if (resolved.contains("codedew.com")) {
+                    if (sniffPlayer(link, callback)) found = true
                 } else {
-                    // e.g. HubCloud - needs an extractor registered for that host
                     loadExtractor(resolved, "$mainUrl/", subtitleCallback) {
                         found = true
                         callback(it)
@@ -179,21 +179,44 @@ class RareToonsIndiaProvider : MainAPI() {
         return found
     }
 
-    /**
-     * The embed player (argon.razorshell.space/embed/<id>) builds its source with JavaScript,
-     * so a WebView is used to sniff the real .m3u8/.mp4 request.
-     */
+    private suspend fun sniffPlayer(link: LinkInfo, callback: (ExtractorLink) -> Unit): Boolean {
+        val res = app.get(
+            link.url,
+            referer = "$mainUrl/",
+            interceptor = WebViewResolver(mediaRegex, timeout = 35_000L)
+        )
+        val src = res.url
+        if (!mediaRegex.containsMatchIn(src)) {
+            val page = app.get(src, referer = "$mainUrl/").document
+            val embed = page.selectFirst("iframe[src]")?.attr("src") ?: return false
+            return extractFromEmbed(embed, src, link, callback)
+        }
+
+        val playerReferer = "https://codedew.com/"
+        val sourceName = "$name ${link.lang} - ${link.label}"
+        if (src.contains(".m3u8")) {
+            M3u8Helper.generateM3u8(sourceName, src, playerReferer).forEach(callback)
+        } else {
+            callback(
+                newExtractorLink(sourceName, sourceName, src, ExtractorLinkType.VIDEO) {
+                    this.referer = playerReferer
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
+        return true
+    }
+
     private suspend fun extractFromEmbed(
         embedUrl: String,
         referer: String,
         link: LinkInfo,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val mediaRegex = Regex("""\.(m3u8|mp4)(\?.*)?$""")
         val res = app.get(
             embedUrl,
             referer = referer,
-            interceptor = WebViewResolver(Regex("""\.(m3u8|mp4)"""), timeout = 20_000L)
+            interceptor = WebViewResolver(mediaRegex, timeout = 30_000L)
         )
         val src = res.url
         if (!mediaRegex.containsMatchIn(src)) return false
