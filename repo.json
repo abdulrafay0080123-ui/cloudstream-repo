@@ -1,0 +1,8 @@
+{
+  "name": "RareToonsIndia Repo",
+  "description": "RareToonsIndia - Hindi dubbed anime & cartoons",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/abdulrafay0080123-ui/cloudstream-repo/builds/plugins.json"
+  ]
+}
