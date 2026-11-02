@@ -146,10 +146,7 @@ class RareToonsIndiaProvider : MainAPI() {
 
     // ---------- Links ----------
 
-    private val mediaRegex = Regex("""\.(m3u8|mp4|mkv)""")
-
-    // Set to false once everything works, to hide the "DBG ..." fake sources
-    private val debugMode = true
+    private val mediaRegex = Regex("""\.(m3u8|mp4|mkv)""", RegexOption.IGNORE_CASE)
 
     // MultQuality first (the site spells it "WatchMultQuality"), then WatchNow, then the rest
     private fun priority(label: String): Int = when {
@@ -158,33 +155,18 @@ class RareToonsIndiaProvider : MainAPI() {
         else -> 2
     }
 
-    // Shows a fake "source" right away, so the text is visible even if loadLinks is cancelled later
-    private suspend fun dbgNow(msg: String, callback: (ExtractorLink) -> Unit) {
-        if (!debugMode) return
-        val n = "DBG " + msg.take(150)
-        callback(newExtractorLink(n, n, "https://example.com/debug.mp4", ExtractorLinkType.VIDEO) {
-            this.referer = ""
-            this.quality = Qualities.Unknown.value
-        })
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val links = try {
-            parseJson<List<LinkInfo>>(data)
-        } catch (e: Exception) {
-            dbgNow("PARSE ERR ${e.message}", callback)
-            return false
-        }
+        val links = try { parseJson<List<LinkInfo>>(data) } catch (_: Exception) { return false }
         // Mega and "DL" buttons are download-only, so only streamable buttons are tried
         val usable = links
+            .map { it.copy(url = fixUrl(it.url)) }
             .filterNot { it.label.contains("mega", true) || it.label.startsWith("DL", true) }
             .sortedBy { priority(it.label) }
-        dbgNow("buttons=" + usable.joinToString(",") { it.label }, callback)
 
         var found = false
 
@@ -195,21 +177,17 @@ class RareToonsIndiaProvider : MainAPI() {
                 if (link.label.contains("hub", true)) {
                     // HubCloud needs an extractor registered for that host
                     val resolved = app.get(link.url, referer = "$mainUrl/").url
-                    dbgNow("${link.label} resolved=$resolved", callback)
                     loadExtractor(resolved, "$mainUrl/", subtitleCallback) {
                         found = true
                         callback(it)
                     }
                 } else {
-                    dbgNow("${link.label}: opening in WebView", callback)
                     if (sniffPlayer(link, callback)) {
                         found = true
-                    } else {
-                        dbgNow("${link.label}: WebView got no media", callback)
                     }
                 }
             } catch (e: Exception) {
-                dbgNow("ERR ${link.label} ${e::class.simpleName}: ${e.message}", callback)
+                continue
             }
         }
 
@@ -218,20 +196,15 @@ class RareToonsIndiaProvider : MainAPI() {
             for (link in usable.filter { it.label.contains("mult", true) }) {
                 try {
                     val resolved = app.get(link.url, referer = "$mainUrl/").url
-                    dbgNow("fallback ${link.label} resolved=$resolved", callback)
                     val id = Regex("""[?&]url=([^&#]+)""").find(resolved)?.groupValues?.get(1)
                     if (resolved.contains("/multiquality/") && id != null) {
                         val embed = "https://argon.razorshell.space/embed/$id"
                         if (extractFromEmbed(embed, "https://codedew.com/", link, callback)) {
                             found = true
                             break
-                        } else {
-                            dbgNow("fallback embed gave no media", callback)
                         }
                     }
-                } catch (e: Exception) {
-                    dbgNow("ERR fallback ${e::class.simpleName}: ${e.message}", callback)
-                }
+                } catch (_: Exception) { continue }
             }
         }
         return found
@@ -263,7 +236,7 @@ class RareToonsIndiaProvider : MainAPI() {
         return true
     }
 
-    /** Opens the embed player directly in a WebView and sniffs the real .m3u8/.mp4 request. */
+    /** Opens the embed player directly in a WebView and sniffs the real .m3u8 request. */
     private suspend fun extractFromEmbed(
         embedUrl: String,
         referer: String,
