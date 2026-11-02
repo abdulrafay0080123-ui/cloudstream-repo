@@ -1,0 +1,24 @@
+[
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=rareanimes.fans&sz=%size%",
+        "fileHash": "sha256-e3120b38838003a4df303e53c3384a8675e3f4416899ca48655749a012dff6cd",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/abdulrafay0080123-ui/cloudstream-repo",
+        "fileSize": 33222,
+        "status": 1,
+        "language": "hi",
+        "authors": [
+            "abdulrafay0080123-ui"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "Cartoon"
+        ],
+        "version": 1,
+        "internalName": "RareToonsIndia",
+        "description": "RareToonsIndia - Hindi dubbed anime & cartoons",
+        "url": "https://raw.githubusercontent.com/abdulrafay0080123-ui/cloudstream-repo/builds/RareToonsIndia.cs3",
+        "name": "RareToonsIndia"
+    }
+]
