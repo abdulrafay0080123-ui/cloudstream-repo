@@ -146,14 +146,11 @@ class RareToonsIndiaProvider : MainAPI() {
 
     // ---------- Links ----------
 
-    private val mediaRegex = Regex("""\.(m3u8|mp4|mkv)""")
+    private val mediaRegex = Regex("""\.(m3u8|mp4|mkv)""", RegexOption.IGNORE_CASE)
 
-    // DEBUG: collected steps, shown as fake "sources" when nothing is found
-    private val dbg = mutableListOf<String>()
-
-    // MultiQuality first (its player is confirmed to work), then WatchNow, then everything else
+    // MultQuality first (the site spells it "WatchMultQuality"), then WatchNow, then the rest
     private fun priority(label: String): Int = when {
-        label.contains("multi", true) -> 0
+        label.contains("mult", true) -> 0
         label.contains("watch", true) -> 1
         else -> 2
     }
@@ -164,72 +161,67 @@ class RareToonsIndiaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val links = parseJson<List<LinkInfo>>(data)
+        val links = try { parseJson<List<LinkInfo>>(data) } catch (_: Exception) { return false }
         // Mega and "DL" buttons are download-only, so only streamable buttons are tried
         val usable = links
+            .map { it.copy(url = fixUrl(it.url)) }
             .filterNot { it.label.contains("mega", true) || it.label.startsWith("DL", true) }
             .sortedBy { priority(it.label) }
-        var found = false
-        dbg.clear()
-        dbg.add("buttons=" + usable.joinToString(",") { it.label })
 
+        var found = false
+
+        // Pass 1: open each button in a WebView (like a real browser: zipper hops -> player page -> iframe)
         for (link in usable) {
             if (found) break
             try {
-                // The button link redirects, e.g. codedew.com/zipper/?url=... -> codedew.com/multiquality/?url=<id>
-                val resolved = app.get(link.url, referer = "$mainUrl/").url
-                dbg.add("${link.label} resolved=$resolved")
-
-                if (resolved.contains("/multiquality/")) {
-                    // The multiquality page injects its <iframe> with JavaScript, so it is not in the HTML
-                    // that OkHttp downloads. The iframe is always argon.razorshell.space/embed/<id>.
-                    val id = Regex("""[?&]url=([^&#]+)""").find(resolved)?.groupValues?.get(1)
-                    if (id != null) {
-                        val embed = "https://argon.razorshell.space/embed/$id"
-                        if (extractFromEmbed(embed, "https://codedew.com/", link, callback)) found = true
-                    }
-                } else if (resolved.contains("codedew.com")) {
-                    // e.g. codedew.com/streambeta/ - JavaScript player, needs the WebView to open the button link
-                    if (sniffPlayer(link, callback)) found = true
-                } else {
-                    // e.g. HubCloud - needs an extractor registered for that host
+                if (link.label.contains("hub", true)) {
+                    // HubCloud needs an extractor registered for that host
+                    val resolved = app.get(link.url, referer = "$mainUrl/").url
                     loadExtractor(resolved, "$mainUrl/", subtitleCallback) {
                         found = true
                         callback(it)
                     }
+                } else {
+                    if (sniffPlayer(link, callback)) {
+                        found = true
+                    }
                 }
             } catch (e: Exception) {
-                dbg.add("ERR ${link.label} ${e::class.simpleName}: ${e.message}")
+                continue
             }
         }
+
+        // Pass 2 (last resort): old method - follow the redirect, then open the embed directly
         if (!found) {
-            dbg.forEach { line ->
-                val n = "DBG " + line.take(180)
-                callback(newExtractorLink(n, n, "https://example.com/debug.mp4", ExtractorLinkType.VIDEO) {
-                    this.referer = ""
-                    this.quality = Qualities.Unknown.value
-                })
+            for (link in usable.filter { it.label.contains("mult", true) }) {
+                try {
+                    val resolved = app.get(link.url, referer = "$mainUrl/").url
+                    val id = Regex("""[?&]url=([^&#]+)""").find(resolved)?.groupValues?.get(1)
+                    if (resolved.contains("/multiquality/") && id != null) {
+                        val embed = "https://argon.razorshell.space/embed/$id"
+                        if (extractFromEmbed(embed, "https://codedew.com/", link, callback)) {
+                            found = true
+                            break
+                        }
+                    }
+                } catch (_: Exception) { continue }
             }
         }
         return found
     }
 
-    /** Opens the button link in a WebView and catches the real .m3u8/.mp4/.mkv request. */
+    /** Opens the button link in a WebView and catches the real .m3u8/.mp4/.mkv request (also from iframes). */
     private suspend fun sniffPlayer(link: LinkInfo, callback: (ExtractorLink) -> Unit): Boolean {
         val res = app.get(
             link.url,
             referer = "$mainUrl/",
-            interceptor = WebViewResolver(mediaRegex, timeout = 35_000L)
+            interceptor = WebViewResolver(mediaRegex, timeout = 25_000L)
         )
         val src = res.url
-        if (!mediaRegex.containsMatchIn(src)) {
-            // Fallback for the older player that used an iframe embed
-            val page = app.get(src, referer = "$mainUrl/").document
-            val embed = page.selectFirst("iframe[src]")?.attr("src") ?: return false
-            return extractFromEmbed(embed, src, link, callback)
-        }
+        if (!mediaRegex.containsMatchIn(src)) return false
 
-        val playerReferer = "https://codedew.com/"
+        val playerReferer =
+            if (link.label.contains("mult", true)) "https://argon.razorshell.space/" else "https://codedew.com/"
         val sourceName = "$name ${link.lang} - ${link.label}"
         if (src.contains(".m3u8")) {
             M3u8Helper.generateM3u8(sourceName, src, playerReferer).forEach(callback)
@@ -244,10 +236,7 @@ class RareToonsIndiaProvider : MainAPI() {
         return true
     }
 
-    /**
-     * Older embed player (iframe) that builds its source with JavaScript,
-     * so a WebView is used to sniff the real .m3u8/.mp4 request.
-     */
+    /** Opens the embed player directly in a WebView and sniffs the real .m3u8 request. */
     private suspend fun extractFromEmbed(
         embedUrl: String,
         referer: String,
@@ -257,10 +246,9 @@ class RareToonsIndiaProvider : MainAPI() {
         val res = app.get(
             embedUrl,
             referer = referer,
-            interceptor = WebViewResolver(mediaRegex, timeout = 30_000L)
+            interceptor = WebViewResolver(mediaRegex, timeout = 25_000L)
         )
         val src = res.url
-        dbg.add("embed=$embedUrl -> got=$src")
         if (!mediaRegex.containsMatchIn(src)) return false
 
         val sourceName = "$name ${link.lang} - ${link.label}"
