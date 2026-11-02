@@ -181,12 +181,15 @@ class RareToonsIndiaProvider : MainAPI() {
                 dbg.add("${link.label} resolved=$resolved")
 
                 if (resolved.contains("/multiquality/")) {
-                    // The multiquality page injects its <iframe> with JavaScript, so it is not in the HTML
-                    // that OkHttp downloads. The iframe is always argon.razorshell.space/embed/<id>.
-                    val id = Regex("""[?&]url=([^&#]+)""").find(resolved)?.groupValues?.get(1)
-                    if (id != null) {
-                        val embed = "https://argon.razorshell.space/embed/$id"
-                        if (extractFromEmbed(embed, "https://codedew.com/", link, callback)) found = true
+                    // The real file is served from codedew.com/cdn/liptron.php/<token> -> 302 -> *.groovy.monster/download/<token>
+                    if (extractMultiQuality(resolved, link, callback)) {
+                        found = true
+                    } else {
+                        // Last resort: the old argon.razorshell.space embed
+                        val id = Regex("""[?&]url=([^&#]+)""").find(resolved)?.groupValues?.get(1)
+                        if (id != null &&
+                            extractFromEmbed("https://argon.razorshell.space/embed/$id", "https://codedew.com/", link, callback)
+                        ) found = true
                     }
                 } else if (resolved.contains("codedew.com")) {
                     // e.g. codedew.com/streambeta/ - JavaScript player, needs the WebView to open the button link
@@ -212,6 +215,90 @@ class RareToonsIndiaProvider : MainAPI() {
             }
         }
         return found
+    }
+
+    // ---------- MultiQuality (codedew.com/multiquality) ----------
+
+    private val codedewReferer = "https://codedew.com/"
+    private val liptronRegex = Regex("""(?:https?:)?(?://codedew\.com)?/cdn/liptron\.php[^"'\s<>\\)]*""")
+    private val hostRegex = Regex("""https?://[^"'\s<>\\)]*groovy\.monster/download/[^"'\s<>\\)]+""")
+    // The final download URL has NO .mp4 extension, so the sniffer must also match /download/ and liptron.php
+    private val sniffRegex = Regex("""(\.(m3u8|mp4|mkv)(\?|$))|groovy\.monster/download/|/cdn/liptron\.php""")
+
+    private fun guessQuality(text: String): Int =
+        Regex("""(\d{3,4})\s*p""", RegexOption.IGNORE_CASE).find(text)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Qualities.Unknown.value
+
+    /** Follows liptron.php WITHOUT downloading the file; returns the Location (the real file URL). */
+    private suspend fun followLiptron(url: String): String? {
+        var cur = url
+        repeat(5) {
+            val r = app.get(cur, referer = codedewReferer, allowRedirects = false)
+            val loc = r.headers["Location"] ?: r.headers["location"]
+            dbg.add("hop ${r.code} ${cur.take(70)} -> ${loc?.take(70)}")
+            if (loc == null) return if (r.code in 200..299 && cur.contains("groovy.monster")) cur else null
+            cur = fixUrlWith(cur, loc)
+            if (cur.contains("groovy.monster/download/")) return cur
+        }
+        return null
+    }
+
+    private fun fixUrlWith(base: String, loc: String): String = when {
+        loc.startsWith("http") -> loc
+        loc.startsWith("//") -> "https:$loc"
+        loc.startsWith("/") -> "https://codedew.com$loc"
+        else -> base.substringBeforeLast("/") + "/" + loc
+    }
+
+    private suspend fun emit(fileUrl: String, quality: Int, link: LinkInfo, callback: (ExtractorLink) -> Unit) {
+        val sourceName = "$name ${link.lang} - ${link.label}"
+        callback(
+            newExtractorLink(sourceName, "$sourceName ${if (quality > 0) "${quality}p" else ""}".trim(), fileUrl, ExtractorLinkType.VIDEO) {
+                this.referer = codedewReferer
+                this.quality = quality
+                this.headers = mapOf("Referer" to codedewReferer, "User-Agent" to USER_AGENT)
+            }
+        )
+    }
+
+    private suspend fun extractMultiQuality(pageUrl: String, link: LinkInfo, callback: (ExtractorLink) -> Unit): Boolean {
+        var any = false
+        // 1) Static HTML: look for liptron.php / groovy.monster URLs (+ the quality label next to them)
+        val html = app.get(pageUrl, referer = "$mainUrl/").text.replace("\\/", "/")
+        dbg.add("mq html=${html.length}b liptron=${liptronRegex.findAll(html).count()} host=${hostRegex.findAll(html).count()}")
+        val seen = HashSet<String>()
+
+        for (m in hostRegex.findAll(html)) {
+            if (!seen.add(m.value)) continue
+            emit(m.value, guessQuality(html.substring(maxOf(0, m.range.first - 200), m.range.first)), link, callback)
+            any = true
+        }
+        for (m in liptronRegex.findAll(html)) {
+            val raw = fixUrlWith(pageUrl, m.value)
+            if (!seen.add(raw)) continue
+            val ctx = html.substring(maxOf(0, m.range.first - 200), minOf(html.length, m.range.last + 200))
+            val file = followLiptron(raw) ?: continue
+            emit(file, guessQuality(ctx), link, callback)
+            any = true
+        }
+        if (any) return true
+
+        // 2) The page builds the links with JavaScript -> sniff them in a WebView
+        val res = app.get(pageUrl, referer = "$mainUrl/", interceptor = WebViewResolver(sniffRegex, timeout = 30_000L))
+        val hit = res.url
+        dbg.add("mq webview hit=${hit.take(120)}")
+        if (!sniffRegex.containsMatchIn(hit)) return false
+        val file = when {
+            hit.contains("groovy.monster/download/") -> hit
+            hit.contains("liptron.php") -> followLiptron(hit) ?: return false
+            hit.contains(".m3u8") -> {
+                M3u8Helper.generateM3u8("$name ${link.lang} - ${link.label}", hit, codedewReferer).forEach(callback)
+                return true
+            }
+            else -> hit
+        }
+        emit(file, guessQuality(pageUrl), link, callback)
+        return true
     }
 
     /** Opens the button link in a WebView and catches the real .m3u8/.mp4/.mkv request. */
